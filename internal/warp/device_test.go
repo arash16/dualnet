@@ -78,19 +78,19 @@ func TestDeviceMTU(t *testing.T) {
 	}
 }
 
-// TestReservedToCfID pins the client_id → reserved-bytes → WGDEVICE_A_CF_ID packing against a
-// real registered account's value (client_id "3pbo" decodes to DE 96 E8). The kernel patch and
-// this encoding must agree, so this locks the convention.
-func TestReservedToCfID(t *testing.T) {
-	r := (&Account{ClientID: "3pbo"}).Reserved()
-	if r != [3]byte{0xDE, 0x96, 0xE8} {
-		t.Fatalf("Reserved() = % x, want DE 96 E8", r[:])
+// TestReserved pins the WARP client_id -> 3 reserved-bytes convention the userspace bind stamps
+// into the WireGuard header: a real account's client_id "3pbo" decodes to DE 96 E8. An absent or
+// malformed client_id must yield zero bytes, so the bind stamps nothing and the kernel path's
+// zeroed reserved header agrees.
+func TestReserved(t *testing.T) {
+	if r := (&Account{ClientID: "3pbo"}).Reserved(); r != [3]byte{0xDE, 0x96, 0xE8} {
+		t.Errorf("Reserved() = % x, want DE 96 E8", r[:])
 	}
-	if got := reservedToCfID(r); got != 0xDE96E8 {
-		t.Errorf("reservedToCfID = %#x, want 0xDE96E8", got)
+	if r := (&Account{}).Reserved(); r != ([3]byte{}) {
+		t.Errorf("Reserved() with no client_id = % x, want 00 00 00", r[:])
 	}
-	if reservedToCfID([3]byte{}) != 0 {
-		t.Error("an absent client_id must pack to 0 so no CF_ID is set")
+	if r := (&Account{ClientID: "!!not-base64!!"}).Reserved(); r != ([3]byte{}) {
+		t.Errorf("Reserved() with malformed client_id = % x, want 00 00 00", r[:])
 	}
 }
 
