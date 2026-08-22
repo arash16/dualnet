@@ -1,0 +1,43 @@
+psk: CHANGEME
+mtu: 1280
+subnet: 10.9.0.0/24
+
+builds:
+  modem: { arch: arm/v5, upx: true } # the 32-bit ARM home router (no hardware float)
+
+stats_interval: 10
+stats_max_mb: 10
+
+protocols: {}
+
+nodes:
+  router:
+    datapath: kernel
+    connections:
+      lan:      { iface: br0 }
+      starlink: { iface: nas10 }
+    egresses:
+      # A kernel WireGuard egress through Cloudflare WARP. `exit` is the UNDERLAY WAN the
+      # tunnel's encrypted UDP leaves through (its endpoint gets a /32 host route via it, so
+      # the tunnel never loops on itself); the device is named warp-warp by default. The host
+      # kernel must provide the wireguard module. warp_cache should be a persistent path so the
+      # node reuses one registered account instead of re-registering every boot. Add
+      # warp_insecure: true if the box has no CA bundle and registration fails to verify the
+      # Cloudflare certificate (it only relaxes that one HTTPS call, not the tunnel).
+      warp: 
+        mode: warp
+        exit: starlink
+        warp_insecure: true
+        # warp_config: /var/usbdisk/sda1/wgcf-profile.conf
+        warp_cache: /var/lib/dualnet/warp.json
+    deploy:
+      mode: ssh
+      build: modem
+      daemonize: none
+      bin_path: /tmp/dualnet
+      config_path: /tmp/dualnet-node.yaml
+
+paths:
+  - node: router
+    routes:
+      default: (warp)   # everything else tunnels out through WARP

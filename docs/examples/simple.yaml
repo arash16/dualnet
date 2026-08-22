@@ -1,0 +1,89 @@
+psk: CHANGEME
+mtu: 1280
+subnet: 10.9.0.0/24
+
+stats_interval: 10
+healthcheck: 5
+healthcheck_timeout: 20
+healthcheck_up_grace: 15
+
+protocols:
+  covert:                 # pi -> vps (upload leg): clean path; also the inbound-UDP-to-vps direction, so keep TCP
+    transport: tcp
+    cipher: chacha4:128
+  covert-dn:              # vps -> pi (downlink to home): ~0.4% loss + reordering. UDP so the INNER tcp owns
+    transport: udp        # retransmission end-to-end instead of a TCP-over-TCP tunnel amplifying the loss into a
+    cipher: chacha4:128   # stall. This direction is inbound to the home Pi, not the constrained inbound-to-vps.
+
+conditions:
+  is-iran: { dst_in: { file: docs/examples/iran.prefixes } }
+  is-svcF: { dst_in: { file: docs/examples/svcF.prefixes } }
+  go-iran: { src_in: { list: [10.99.0.0/29] } }
+
+builds:
+  server: { arch: amd64 }
+  relay:  { arch: arm64 }
+  modem:  { arch: arm/v5, upx: true }
+
+nodes:
+  router:
+    datapath: kernel
+    connections:
+      lan:      { iface: br0 }
+      ftth:     { iface: ppp1 }
+      starlink: { iface: nas10 }
+    egresses:
+      ftth:     { mode: kernel, exit: ftth }
+      starlink: { mode: kernel, exit: starlink }
+    deploy: 
+      mode: ssh
+      build: modem
+      daemonize: none
+      bin_path: /tmp/dualnet
+      config_path: /tmp/dualnet-node.yaml
+
+  vps:                    # in-country rendezvous for the outdoor path (cellular → vps → pi)
+    ip: 203.0.113.20
+    connections:
+      wan:   { iface: eth0 }
+      V2Ray: { type: tun, iface: dualnet0, ip: 10.9.0.5 }   # fed by v2ray; not a capture tun
+    egresses:
+      intranet: { mode: kernel, exit: wan, tun_name: dnexit0 }
+    deploy: 
+      mode: ssh
+      build: server
+      daemonize: systemd
+
+  pi:
+    connections:
+      auto:  { iface: eth1 }
+    egresses:
+      direct: 
+        mode: kernel
+        exit: auto
+      warped: 
+        mode: warp
+        warp_cache: /var/lib/dualnet/warp.json
+    deploy:
+      mode: ssh
+      build: relay
+      daemonize: systemd
+      bin_path: /home/arash16/dualnet
+      config_path: /home/arash16/dualnet-node.yaml
+
+links:
+  pi-vps: pi -> vps (covert, 9001)
+  vps-pi: pi <- vps (covert-dn, 9002)
+
+paths:
+  - node: router
+    routes:
+      go-iran: (ftth)
+      is-iran: (ftth)
+      default: (starlink)
+
+  - node: vps
+    routes:
+      is-iran: (intranet)
+      is-svcF: vps-pi > (direct) > pi-vps
+      default: vps-pi > (warped) > pi-vps

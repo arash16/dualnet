@@ -1,0 +1,46 @@
+psk: CHANGEME
+mtu: 1280
+subnet: 10.9.0.0/24
+
+builds:
+  modem:  { arch: arm/v5, upx: true } # the 32-bit ARM home router (no hardware float)
+
+# stats_file: /var/log/dualnet-stats.jsonl
+stats_interval: 10
+stats_max_mb: 10
+
+# Default healthcheck timing (a condition may override per-condition): probe every 5s,
+# declare down after 20s of silence, up only after 15s of sustained liveness.
+healthcheck: 5
+healthcheck_timeout: 20
+healthcheck_up_grace: 15
+
+protocols: {}
+
+conditions:
+  is-iran: { dst_in: { file: docs/examples/iran.prefixes } }  # big set -> FIB routes
+
+nodes:
+  router:
+    datapath: kernel
+    connections: 
+      lan: { iface: br0 }
+      ftth: { iface: ppp1 }
+      starlink: { iface: nas10 }
+    egresses:
+      ftth: { mode: kernel, exit: ftth }
+      starlink: { mode: kernel, exit: starlink }
+    deploy:
+      mode: ssh
+      build: modem
+      daemonize: none
+      bin_path: /tmp/dualnet
+      config_path: /tmp/dualnet-node.yaml
+      # files_dir defaults to the config dir (/tmp), so is-iran's prefix file lands at
+      # /tmp/iran.prefixes — writable, unlike the squashfs /etc.
+
+paths:
+  - node: router # the router's LAN traffic
+    routes:
+      is-iran: (ftth)        # iran prefixes → FTTH (FIB)
+      default: (starlink)    # everything else → Starlink

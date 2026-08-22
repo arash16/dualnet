@@ -1,0 +1,7 @@
+.git
+*.md
+/dualnet*
+/dist
+/deploy
+/scripts
+/logs

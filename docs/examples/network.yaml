@@ -1,0 +1,151 @@
+# Home asymmetric-bond mesh: a FAST kernel router, a bonding laptop, and a relay pi.
+#
+# `dualnet compile -network home-bond.yaml -out ./configs/` expands this into one <node>.yaml
+# per node. It demonstrates the two datapaths and source-IP conditional routing:
+#
+#   - router (datapath: kernel) — a dumb, fast forwarder. It does NO userspace packet work
+#     (no tun, no cipher): it just programs `ip rule` / `ip route` + iptables MASQUERADE so the
+#     box forwards near line rate. It steers by SOURCE IP (`go-iran` → FTTH) and by geo
+#     (`is-iran` → FTTH); everything else → Starlink.
+#   - laptop (datapath: userspace) — a wifi machine. It captures all its traffic and bonds
+#     foreign flows to `turkish`: the UP-leg is bound to a source in 10.99.0.0/29 so the router
+#     steers it out FTTH (fast upload — that is what `go-iran` means: "route it like Iran, out
+#     FTTH"), while the unmarked DOWN-leg returns over Starlink (fast download). Iran exits
+#     locally, and a healthcheck falls the tunnel back to a direct exit when `turkish` is down.
+#     MULTIPLE laptops run this one compiled laptop.yaml — just bump each copy's tun address
+#     (10.9.0.3, .4, …) and up-leg IP (10.99.0.1, .2, … within 10.99.0.0/29). `turkish`'s
+#     down-leg is `multiple`+`assigns_id`, so one turkish tracks them all by owner id.
+#   - pi — a pure relay with no capture/egress of its own: it only carries the `vps` node's
+#     download leg home (turkish → pi → vps), so an outdoor phone gets the home's fast Starlink.
+#
+# Why source-IP and not DSCP: on the real router (kernel 4.4) `ip rule ... dsfield` is rejected
+# and the DS field is masked, so DSCP-based fib rules don't work; `ip rule from <src>` does.
+psk: CHANGEME
+mtu: 1280
+subnet: 10.9.0.0/24
+
+stats_interval: 10
+healthcheck: 5
+healthcheck_timeout: 20
+healthcheck_up_grace: 15
+
+protocols:
+  covert:                 # pi -> vps (upload leg): clean path; also the inbound-UDP-to-vps direction, so keep TCP
+    transport: tcp
+    cipher: chacha4:128
+  covert-dn:              # vps -> pi (downlink to home): ~0.4% loss + reordering. UDP so the INNER tcp owns
+    transport: udp        # retransmission end-to-end instead of a TCP-over-TCP tunnel amplifying the loss into a
+    cipher: chacha4:128   # stall. This direction is inbound to the home Pi, not the constrained inbound-to-vps.
+  fast:
+    transport: udp
+
+conditions:
+  is-iran: { dst_in: { file: docs/examples/iran.prefixes } }  # iran destinations (a big set → FIB routes)
+  go-iran: { src_in: { list: [10.99.0.0/29] } }               # the up-leg subnet — "route these sources like Iran (out FTTH)"
+  healthyT: { healthcheck: { path: laptop } }                 # liveness of a laptop's tunnel to turkish
+
+builds:
+  modem:  { arch: arm/v5, upx: true } # the softfloat home router (kernel node)
+  server: { arch: amd64 }
+  relay:  { arch: arm64 }
+  # the laptop runs locally (no deploy), so it needs no build recipe.
+
+nodes:
+  router:                 # kernel datapath: fast forwarder, no userspace packet handling
+    datapath: kernel
+    # Connections name the router's attachments; egress `exit` references them. The LAN is
+    # derived (a connection that is not a WAN exit); the WANs are the egresses' exits.
+    connections:
+      lan:      { iface: br0 }
+      ftth:     { iface: ppp1 }
+      starlink: { iface: nas10 }
+    # A kernel egress is just a WAN: dualnet builds its routing table (default via the WAN) +
+    # MASQUERADE out its exit iface. The gateway is auto-detected (a PPPoE link routes dev-only).
+    egresses:
+      ftth:     { mode: kernel, exit: ftth }
+      starlink: { mode: kernel, exit: starlink }
+    deploy: 
+      mode: ssh
+      build: modem
+      daemonize: none
+      bin_path: /tmp/dualnet
+      config_path: /tmp/dualnet-node.yaml
+
+  laptop:                 # userspace datapath: captures my traffic, bonds foreign flows to turkish
+    connections:
+      auto:  { iface: en0 }                     # my normal (unmarked) source
+      iran:  { iface: en0, ip: 10.99.0.1/32 }   # up-leg source; dualnet creates it, the router steers it out FTTH
+      tund:  { type: tun, ip: 10.9.0.3, capture_default: true }   # the capture tun (iface omitted = auto)
+    # `direct` (userspace) re-originates the flow, so a local exit does not collide with the
+    # capture tun's conntrack; it carries iran + the turkish-down fallback (both light).
+    egresses:
+      direct: { mode: direct, exit: auto }
+    # (no deploy: this is my machine — run it directly with `dualnet -config laptop.yaml`.)
+
+  turkish:                # out-of-country exit + asymmetric-bond reassembly point
+    ip: 198.51.100.10
+    connections: { wan: { iface: eth0 } }
+    egresses:
+      internet: { mode: kernel, exit: wan }
+    deploy:
+      mode: k8s
+      build: server
+      image: arash16/dualnet:latest
+
+  vps:                    # in-country rendezvous for the outdoor path (cellular → vps → pi)
+    ip: 203.0.113.20
+    connections:
+      wan:   { iface: eth0 }
+      V2Ray: { type: tun, iface: dualnet0, ip: 10.9.0.5 }   # fed by v2ray; not a capture tun
+    egresses:
+      intranet: { mode: kernel, exit: wan, tun_name: dnexit0 }
+    deploy: 
+      mode: ssh
+      build: server
+      daemonize: systemd
+
+  pi:                     # pure relay for the outdoor path: no capture, no egress, no own routes
+    deploy:
+      mode: ssh
+      build: relay
+      daemonize: systemd
+      bin_path: /home/arash16/dualnet
+      config_path: /home/arash16/dualnet-node.yaml
+
+# One line per link: <dialer>[.<conn>] <arrow> <acceptor>[.<conn>] (<protocol>, <port>). The
+# dialer is always on the left; `->` the dialer sends (to-acceptor), `<-` the acceptor sends
+# (to-dialer). Double the point for `multiple` (->>/<<-); embed a dialer tun-connection name to
+# make the acceptor assign that tun's owner id (`<tund-`, or `<<tund-` with multiple).
+links:
+  laptop-turkish: laptop.iran ->      turkish (covert, 8443)     # up-leg: sourced in 10.99.0.0/29 (router → FTTH)
+  turkish-laptop: laptop.auto <<tund- turkish (fast, 8444)      # down-leg: multiple + assigns the laptop's `tund` tun id,
+                                                                # so ONE turkish serves many laptops (each a distinct owner)
+  turkish-pi:     pi          <- turkish (fast, 8445)           # vps download leg: turkish → pi
+  pi-vps:         pi          -> vps     (covert, 9001)         # vps download leg: pi → vps.
+  vps-turkish:    vps         -> turkish (covert-dn, 8446)
+
+# Routes are a switch-case: each key is a condition (or `default`, the always-last catch-all),
+# each value `up > … > (egress) > down > …`. A lone (egress) is a local exit; the gateway is
+# inferred as the terminus of the last up-link. `name:` is only needed for healthcheck refs.
+paths:
+  # The router's kernel forwarding policy. Order is enforced: src_in first, then dst_in, then
+  # default (matching the fixed kernel precedence ip rule > FIB route > default).
+  - node: router
+    routes:
+      go-iran: (ftth)        # ip rule from 10.99.0.1 → FTTH (fast upload for the foreign up-leg)
+      is-iran: (ftth)        # iran prefixes → FTTH (FIB)
+      default: (starlink)    # everything else → Starlink
+
+  # The laptop bonds foreign traffic to turkish while healthy, else exits directly; iran is local.
+  - name: laptop
+    node: laptop
+    routes:
+      is-iran: (direct)
+      healthyT: laptop-turkish > (internet) > turkish-laptop  # bond up FTTH / down Starlink
+      default: (direct)                                       # turkish down → direct fallback
+
+  # The outdoor path: up vps → turkish directly, replies back turkish → pi → vps.
+  - node: vps
+    routes:
+      is-iran: (intranet)
+      default: vps-turkish > (internet) > turkish-pi > pi-vps

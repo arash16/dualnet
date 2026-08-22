@@ -1,0 +1,10 @@
+/dualnet
+/dist/
+/todo.*
+# compiled per-node configs (generated from docs/examples/network.yaml)
+/configs/
+# stats logs fetched from the mesh
+/logs/
+
+# local copies of real-address configs (never committed)
+/.private/

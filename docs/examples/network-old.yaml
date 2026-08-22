@@ -1,0 +1,133 @@
+# Root network schema — the whole mesh declared once. `dualnet compile -network
+# network.yaml -out ./configs/` expands it into one <node>.yaml per node.
+#
+# Nothing is repeated: each node's reachable IP, named connections, and named
+# egresses are declared once; each named protocol (a transport plus its carrier config) is
+# declared once and referenced by links; each link is one readable line; named conditions (a
+# dst-IP set test, or a healthcheck) are referenced by a route's condition key; and every
+# node's routing table is DERIVED from the paths' branches.
+#
+# Real 3-node setup: a home ROUTER (Linux) that routes the whole LAN, an out-of-country
+# gateway (turkish), and an in-country vps running v2ray for off-home mobile clients.
+# The router has two uplinks terminating on it: FTTH over PPPoE (ppp1) and Starlink (the
+# WAN port nas10, the system default). The PSK is a placeholder — provide the real one via
+# DUALNET_PSK / -psk.
+psk: CHANGEME
+mtu: 1280
+subnet: 10.9.0.0/24
+
+# stats_file: /var/log/dualnet-stats.jsonl
+stats_interval: 10
+stats_max_mb: 10
+
+# Default healthcheck timing (a condition may override per-condition): probe every 5s,
+# declare down after 20s of silence, up only after 15s of sustained liveness.
+healthcheck: 5
+healthcheck_timeout: 20
+healthcheck_up_grace: 15
+
+# Named protocols: a transport (http | udp) plus its carrier config, referenced by a link's
+# protocol. The same protocol drives BOTH ends of every link that uses it, so their paths,
+# headers, and cipher agree by construction.
+protocols:
+  # A "covert" HTTP protocol dressed up as a mundane object-store API.
+  covert:
+    transport: http
+    upload_path: /api/v2/objects
+    download_path: /api/v2/events
+    user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    headers: { X-Client-Version: "2.4.1" }
+    cipher: chacha4
+  fast:           { transport: udp }
+  fast-encrypted: { transport: udp, cipher: chacha4 }
+
+# Named conditions: predicates a route's condition key references.
+#  - dst_in: the packet's destination ∈ a prefix set (a file, reloadable on SIGHUP, or an
+#    inline list), matched in-process with a cached longest-prefix table.
+#  - healthcheck: probes the FULL round-trip of a named path's gateway branch and tracks its
+#    liveness. Its probe runs whether or not any branch references it.
+conditions:
+  # dst_in.file is a LOCAL source path (relative to the repo root, or absolute): deploy copies
+  # it to each using node's deploy.files_dir, and the node reads it from there at runtime.
+  is-iran: { dst_in: { file: docs/examples/iran.prefixes } }
+  turkey:     { healthcheck: { path: lan } }   # liveness of the `lan` path's tunnel to turkish
+  vps-turkey: { healthcheck: { path: vps } }   # liveness of the `vps` path's tunnel to turkish
+
+# Named build recipes: how to cross-compile the binary for each target arch (referenced by a
+# node's deploy.build). Kept separate from deployment because a build is reused across modes.
+builds:
+  # arm/v5 = softfloat: the modem's CPU reports armv7l but /proc/cpuinfo Features has no `vfp`,
+  # so a GOARM=7 (VFPv3) build faults with SIGILL. upx shrinks the ~14MB binary to ~3.5MB.
+  modem:  { arch: arm/v5, upx: true } # the 32-bit ARM home router (no hardware float)
+  server: { arch: amd64 }             # the amd64 VPSes (turkish, vps)
+
+nodes:
+  router: # Linux home router; LAN gateway (192.168.1.1) for the whole house
+    # Connections name a node's attachments (the key is the name). A plain `{ iface }` is an
+    # interface binding (add `ip` for a socket source a link binds); a `{ type: tun }` is a local
+    # tun. Egress `exit`, a link's `.conn`, and id-setter arrows reference these by key.
+    connections:
+      lan:      { iface: br0 }
+      ftth:     { iface: ppp1 }
+      starlink: { iface: nas10 }
+      # The capture tun takes the default route (after the node is fully up); LAN traffic on the
+      # `lan` connection is forwarded into it and split by the routes below. A crash drops the
+      # tun and the kernel restores the untouched Starlink default. iface = OS device (auto if
+      # omitted), ip = inner address.
+      Tun: { type: tun, iface: dnlan0, ip: 10.9.0.2, capture_default: true, lan: lan }
+    # Named egresses. `direct` = a userspace netstack that dials out a socket bound to the
+    # interface (no kernel NAT), so it works on a non-default link and never collides with
+    # the capture tun's conntrack.
+    egresses:
+      ftth:     { mode: direct, exit: ftth }
+      starlink: { mode: direct, exit: starlink }
+    # busybox modem: no systemd. Copy to the in-RAM /tmp (squashfs root is read-only) and just
+    # launch it — dualnet's singleton kills the prior instance. host defaults to "router".
+    deploy:
+      mode: ssh
+      build: modem
+      daemonize: none
+      bin_path: /tmp/dualnet
+      config_path: /tmp/dualnet-node.yaml
+
+  turkish: # out-of-country gateway
+    ip: 198.51.100.10
+    connections: { wan: { iface: eth0 } }
+    egresses:
+      internet: { mode: kernel, exit: wan }
+    # amd64 k3s gateway. image is used for BOTH `docker -t` and the manifest. A generated
+    # turkish.k8s.yaml carries the ConfigMap+Deployment.
+    deploy: { mode: k8s, build: server, image: arash16/dualnet:latest }
+
+  vps: # in-country relay + local tun (fed by a v2ray server, not the system default)
+    ip: 203.0.113.20
+    connections:
+      V2Ray: { type: tun, iface: dualnet0, ip: 10.9.0.5 }   # fed by v2ray; not a capture tun
+    deploy: { mode: ssh, build: server, daemonize: systemd }
+
+# One line per link: <dialer>[.<conn>] <arrow> <acceptor>[.<conn>] (<protocol>, <port>).
+# `->` = to-acceptor (the dialer sends, an uplink); `<-` = to-dialer (the acceptor sends, a
+# downlink to a NAT'd client that dialed out). The dialer is always on the left.
+links:
+  router-up:      router.ftth     -> turkish (covert, 8443)
+  turkish-router: router.starlink <- turkish (fast, 8444)
+  router-vps:     router.ftth     -> vps     (fast-encrypted, 9001)
+  vps-up:         vps             -> turkish (covert, 8445)
+
+# A path is one node's traffic as an ordered switch-case: each key is a condition (or `default`,
+# the always-last catch-all), each value a route. A route is `up > … > (egress) > down > …`:
+# tokens before the parenthesized egress are up-links (origin→gateway), tokens after are down-links
+# (gateway→origin); a lone (egress) is a local exit. The gateway is inferred (the up-path's end).
+# `name:` is optional — set only so a healthcheck can reference the path.
+paths:
+  - name: lan  # the router's LAN traffic
+    node: router
+    routes:
+      is-iran: (ftth)                                       # Iran → straight out FTTH
+      turkey:  router-up > (internet) > turkish-router      # else tunnel to Turkey (reply via Starlink)
+      default: (starlink)                                   # Turkey unhealthy → direct Starlink
+
+  - name: vps  # the vps's v2ray traffic: up to Turkey, reply back via Starlink→router→vps
+    node: vps
+    routes:
+      default: vps-up > (internet) > turkish-router > router-vps
